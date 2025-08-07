@@ -1,1 +1,2 @@
-python bot.py
+web: python binance_bot_project/bot.py
+
