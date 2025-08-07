@@ -1,0 +1,12 @@
+app = "bot-flyio"
+primary_region = "cdg"
+
+[build]
+image = "python:3.10-slim"
+
+[env]
+PYTHONUNBUFFERED = "1"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1024"
