@@ -1,3 +1,4 @@
-worker: python binance_bot_project/bot.py
+worker: python bot.py
+
 
 
