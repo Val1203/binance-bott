@@ -1,6 +1,45 @@
 import os, json, time, datetime as dt
-import pandas as pd
 from pathlib import Path
+import pandas as pd
+import os
+from openpyxl import load_workbook
+
+def update_excel(local_path, gains_jour):
+    # gains_jour = float, montant gagné aujourd'hui en USDC
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    semaine = datetime.utcnow().strftime("%Y-%U")  # année-semaine
+    mois = datetime.utcnow().strftime("%Y-%m")     # année-mois
+
+    if os.path.exists(local_path):
+        # Charger l'existant
+        with pd.ExcelWriter(local_path, mode="a", engine="openpyxl", if_sheet_exists="overlay") as writer:
+            # Journal
+            journal_df = pd.read_excel(local_path, sheet_name="Journal")
+            journal_df = pd.concat([journal_df, pd.DataFrame([[today, gains_jour]], columns=["Date", "Gains USDC"])])
+            journal_df.to_excel(writer, sheet_name="Journal", index=False)
+
+            # Hebdo
+            hebdo_df = journal_df.copy()
+            hebdo_df["Semaine"] = pd.to_datetime(hebdo_df["Date"]).dt.strftime("%Y-%U")
+            hebdo_total = hebdo_df.groupby("Semaine")["Gains USDC"].sum().reset_index()
+            hebdo_total.to_excel(writer, sheet_name="Hebdo", index=False)
+
+            # Mensuel
+            mensuel_df = journal_df.copy()
+            mensuel_df["Mois"] = pd.to_datetime(mensuel_df["Date"]).dt.strftime("%Y-%m")
+            mensuel_total = mensuel_df.groupby("Mois")["Gains USDC"].sum().reset_index()
+            mensuel_total.to_excel(writer, sheet_name="Mensuel", index=False)
+    else:
+        # Créer de zéro
+        journal_df = pd.DataFrame([[today, gains_jour]], columns=["Date", "Gains USDC"])
+        hebdo_df = pd.DataFrame([[semaine, gains_jour]], columns=["Semaine", "Gains USDC"])
+        mensuel_df = pd.DataFrame([[mois, gains_jour]], columns=["Mois", "Gains USDC"])
+
+        with pd.ExcelWriter(local_path, mode="w", engine="openpyxl") as writer:
+            journal_df.to_excel(writer, sheet_name="Journal", index=False)
+            hebdo_df.to_excel(writer, sheet_name="Hebdo", index=False)
+            mensuel_df.to_excel(writer, sheet_name="Mensuel", index=False)
+
 
 # === CONFIG TRADING ============================================================
 PAIR            = os.getenv("PAIR", "BTCUSDC")
