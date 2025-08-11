@@ -109,6 +109,16 @@ def make_reports():
         by_week.to_excel(xw, sheet_name="HEBDO", index=False)
         by_month.to_excel(xw, sheet_name="MENSUEL", index=False)
         summary.to_excel(xw, sheet_name="RESUME", index=False)
+from datetime import datetime
+from gdrive_uploader import upload_to_gdrive
+
+# Après avoir enregistré l'Excel dans local_path
+local_path = "/app/rapports/rapport.xlsx"  # adapte si besoin
+today = datetime.utcnow().strftime("%Y-%m-%d")
+dest_name = f"rapport_{today}.xlsx"
+
+file_id = upload_to_gdrive(local_path=local_path, dest_name=dest_name)
+print(f"[Drive] Rapport envoyé, file_id={file_id}")
 
 # === TAILLE D’ORDRE ET GARDE-FOUS ============================================
 def allowed_notional_left():
