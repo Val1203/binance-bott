@@ -112,10 +112,9 @@ def make_reports():
 from datetime import datetime
 from gdrive_uploader import upload_to_gdrive
 
-# Après avoir enregistré l'Excel dans local_path
-local_path = "/app/rapports/rapport.xlsx"  # adapte si besoin
-today = datetime.utcnow().strftime("%Y-%m-%d")
-dest_name = f"rapport_{today}.xlsx"
+local_path = "/app/rapports/rapports.xlsx"  # même fichier tout le temps
+dest_name = "rapports.xlsx"
+
 
 file_id = upload_to_gdrive(local_path=local_path, dest_name=dest_name)
 print(f"[Drive] Rapport envoyé, file_id={file_id}")
