@@ -23,7 +23,7 @@ SL_PCT = float(os.getenv("SL_PCT", "0.003"))   # -0.3% stop-loss
 SLEEP_SEC = int(os.getenv("SLEEP_SEC", "20"))  # boucle
 
 # Mode test par défaut (tu devras mettre LIVE=1 pour le vrai)
-LIVE = os.getenv("LIVE", "0") == "1"
+LIVE = os.getenv("LIVE_TRADING", "0") == "1"
 
 # Google Sheets
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()  # l’ID du classeur
