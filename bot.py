@@ -1,224 +1,300 @@
-import os, json, time, datetime as dt
-from pathlib import Path
-import pandas as pd
 import os
-from openpyxl import load_workbook
+import json
+import time
+import math
+import signal
+from datetime import datetime, timezone
+from dateutil import tz
 
-def update_excel(local_path, gains_jour):
-    # gains_jour = float, montant gagné aujourd'hui en USDC
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    semaine = datetime.utcnow().strftime("%Y-%U")  # année-semaine
-    mois = datetime.utcnow().strftime("%Y-%m")     # année-mois
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
 
-    if os.path.exists(local_path):
-        # Charger l'existant
-        with pd.ExcelWriter(local_path, mode="a", engine="openpyxl", if_sheet_exists="overlay") as writer:
-            # Journal
-            journal_df = pd.read_excel(local_path, sheet_name="Journal")
-            journal_df = pd.concat([journal_df, pd.DataFrame([[today, gains_jour]], columns=["Date", "Gains USDC"])])
-            journal_df.to_excel(writer, sheet_name="Journal", index=False)
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
-            # Hebdo
-            hebdo_df = journal_df.copy()
-            hebdo_df["Semaine"] = pd.to_datetime(hebdo_df["Date"]).dt.strftime("%Y-%U")
-            hebdo_total = hebdo_df.groupby("Semaine")["Gains USDC"].sum().reset_index()
-            hebdo_total.to_excel(writer, sheet_name="Hebdo", index=False)
+# ==========
+#   PARAMS
+# ==========
+SYMBOL = os.getenv("SYMBOL", "BTCUSDC")       # paire
+MAX_USDC = float(os.getenv("MAX_USDC", "1000"))  # budget max
+TRADE_FRACTION = float(os.getenv("TRADE_FRACTION", "0.02"))  # 2% du budget max / trade
+TP_PCT = float(os.getenv("TP_PCT", "0.002"))   # +0.2% take-profit
+SL_PCT = float(os.getenv("SL_PCT", "0.003"))   # -0.3% stop-loss
+SLEEP_SEC = int(os.getenv("SLEEP_SEC", "20"))  # boucle
 
-            # Mensuel
-            mensuel_df = journal_df.copy()
-            mensuel_df["Mois"] = pd.to_datetime(mensuel_df["Date"]).dt.strftime("%Y-%m")
-            mensuel_total = mensuel_df.groupby("Mois")["Gains USDC"].sum().reset_index()
-            mensuel_total.to_excel(writer, sheet_name="Mensuel", index=False)
-    else:
-        # Créer de zéro
-        journal_df = pd.DataFrame([[today, gains_jour]], columns=["Date", "Gains USDC"])
-        hebdo_df = pd.DataFrame([[semaine, gains_jour]], columns=["Semaine", "Gains USDC"])
-        mensuel_df = pd.DataFrame([[mois, gains_jour]], columns=["Mois", "Gains USDC"])
+# Mode test par défaut (tu devras mettre LIVE=1 pour le vrai)
+LIVE = os.getenv("LIVE", "0") == "1"
 
-        with pd.ExcelWriter(local_path, mode="w", engine="openpyxl") as writer:
-            journal_df.to_excel(writer, sheet_name="Journal", index=False)
-            hebdo_df.to_excel(writer, sheet_name="Hebdo", index=False)
-            mensuel_df.to_excel(writer, sheet_name="Mensuel", index=False)
+# Google Sheets
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()  # l’ID du classeur
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS", "").strip()
 
+# Binance API
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
 
-# === CONFIG TRADING ============================================================
-PAIR            = os.getenv("PAIR", "BTCUSDC")
-MAX_CAP_USDC    = float(os.getenv("MAX_CAP_USDC", "1000"))   # capital max alloué
-ORDER_NOTIONAL  = float(os.getenv("ORDER_NOTIONAL", "25"))   # ~taille d'un ordre (USDC)
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.05"))/100  # ex: 0.05% -> scalps
-STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", "0.20"))/100    # ex: 0.20%
-LIVE_TRADING    = os.getenv("LIVE_TRADING", "0") == "1"      # 1 = compte réel, 0 = test
+PARIS_TZ = tz.gettz("Europe/Paris")
 
-# === FICHIERS (Railway) =======================================================
-DATA_DIR = Path("./data")
-DATA_DIR.mkdir(exist_ok=True)
-STATE_FILE  = DATA_DIR / "state.json"           # position + PRU
-TRADES_CSV  = DATA_DIR / "trades.csv"           # append des trades
-REPORT_XLSX = DATA_DIR / "rapport_trading.xlsx" # rapport Excel complet
+# État global simple
+running = True
+position = None              # {"qty": float, "cost": float, "tp": float, "sl": float}
+daily_pnl_usdc = 0.0
+last_pnl_date = None
 
-# === ETAT (position & PRU) ====================================================
-def load_state():
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {"position_qty": 0.0, "avg_cost": 0.0, "used_cap": 0.0}
-
-def save_state(s):
-    STATE_FILE.write_text(json.dumps(s))
-
-state = load_state()
-
-# === OUTILS ===================================================================
+# ==========
+#  UTILS
+# ==========
 def now_paris():
-    return dt.datetime.utcnow() + dt.timedelta(hours=2)
+    return datetime.now(tz=PARIS_TZ)
 
-def df_trades():
-    if TRADES_CSV.exists():
-        return pd.read_csv(TRADES_CSV)
-    return pd.DataFrame(columns=[
-        "time", "side", "symbol", "price", "qty", "notional", "fee",
-        "realized_pnl", "note"
-    ])
+def day_key(dt):
+    return dt.strftime("%Y-%m-%d")
 
-def append_trade(side, price, qty, fee=0.0, realized_pnl=0.0, note=""):
-    d = df_trades()
-    notional = price * qty
-    d.loc[len(d)] = [
-        now_paris().strftime("%Y-%m-%d %H:%M:%S"), side, PAIR,
-        round(price, 6), round(qty, 8), round(notional, 2),
-        round(fee, 2), round(realized_pnl, 2), note
-    ]
-    d.to_csv(TRADES_CSV, index=False)
+def iso_week(dt):
+    return dt.isocalendar()[1]
 
-def update_position_on_buy(price, qty):
-    """moyenne pondérée pour le PRU"""
-    global state
-    pos = state["position_qty"]
-    avg = state["avg_cost"]
-    new_pos = pos + qty
-    if new_pos <= 0:
-        state["position_qty"] = 0.0
-        state["avg_cost"] = 0.0
+def log(*args):
+    print(*args, flush=True)
+
+# ==========
+#   SHEETS
+# ==========
+def gs_client():
+    if not GOOGLE_CREDENTIALS:
+        raise ValueError("La variable d'env GOOGLE_CREDENTIALS est absente dans Railway.")
+    creds_dict = json.loads(GOOGLE_CREDENTIALS)
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    return gspread.authorize(credentials)
+
+def get_worksheet(gc, name):
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    try:
+        return sh.worksheet(name)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=name, rows=2000, cols=10)
+        if name == "Journal":
+            ws.update("A1:C1", [["date", "pnl_usdc", "comment"]])
+        elif name == "Hebdo":
+            ws.update("A1:B1", [["Semaine", "Total_USDC"]])
+        return ws
+
+def append_journal(pnl, comment=""):
+    """Ajoute une ligne dans Journal pour la date du jour."""
+    if not SPREADSHEET_ID:
+        return
+    gc = gs_client()
+    ws = get_worksheet(gc, "Journal")
+    today = day_key(now_paris())
+    ws.append_row([today, round(pnl, 6), comment])
+
+def update_hebdo(pnl):
+    """Cumul par semaine (feuille Hebdo)."""
+    if not SPREADSHEET_ID:
+        return
+    gc = gs_client()
+    ws = get_worksheet(gc, "Hebdo")
+    week = iso_week(now_paris())
+    records = ws.get_all_records()
+    weeks = [r["Semaine"] for r in records] if records else []
+    if week in weeks:
+        # +2: header + 1-based index
+        idx = weeks.index(week) + 2
+        current = ws.cell(idx, 2).value
+        current = float(current) if current else 0.0
+        ws.update_cell(idx, 2, round(current + pnl, 6))
     else:
-        state["avg_cost"] = (pos*avg + qty*price) / new_pos
-        state["position_qty"] = new_pos
-    state["used_cap"] = min(state.get("used_cap", 0.0) + price*qty, MAX_CAP_USDC)
-    save_state(state)
+        ws.append_row([week, round(pnl, 6)])
 
-def update_position_on_sell(price, qty):
-    """réalise le PNL sur la quantité vendue"""
-    global state
-    avg = state["avg_cost"]
-    pos = state["position_qty"]
-    qty = min(qty, pos)  # sécurité
-    realized = (price - avg) * qty
-    state["position_qty"] = round(pos - qty, 8)
-    if state["position_qty"] == 0:
-        state["avg_cost"] = 0.0
-        state["used_cap"] = 0.0
-    save_state(state)
-    return realized
+def flush_daily_pnl():
+    global daily_pnl_usdc
+    if abs(daily_pnl_usdc) > 1e-9:
+        append_journal(daily_pnl_usdc, "Auto close day")
+        update_hebdo(daily_pnl_usdc)
+        log(f"[{day_key(now_paris())}] PNL Journal+Hebdo écrit : {daily_pnl_usdc:.6f} USDC")
+        daily_pnl_usdc = 0.0
 
-# === RAPPORTS EXCEL ============================================================
-def make_reports():
-    d = df_trades()
-    if d.empty:
+# ==========
+#  BINANCE
+# ==========
+def binance_client():
+    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+        raise ValueError("BINANCE_API_KEY / BINANCE_API_SECRET manquent.")
+
+    c = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET, testnet=(not LIVE))
+    # Testnet spot
+    if not LIVE:
+        # Endpoint testnet spot (binance.vision)
+        c.API_URL = "https://testnet.binance.vision/api"
+    return c
+
+def get_symbol_info(client, symbol):
+    info = client.get_symbol_info(symbol)
+    if not info:
+        raise ValueError(f"Symbol info introuvable pour {symbol}")
+    lot_filter = next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")
+    tick_filter = next(f for f in info["filters"] if f["filterType"] == "PRICE_FILTER")
+    step_size = float(lot_filter["stepSize"])
+    min_qty = float(lot_filter["minQty"])
+    tick_size = float(tick_filter["tickSize"])
+    return {
+        "step": step_size,
+        "min_qty": min_qty,
+        "tick": tick_size
+    }
+
+def round_step(qty, step):
+    if step <= 0:
+        return qty
+    return math.floor(qty / step) * step
+
+def round_tick(price, tick):
+    if tick <= 0:
+        return price
+    return math.floor(price / tick) * tick
+
+def get_last_price(client):
+    t = client.get_symbol_ticker(symbol=SYMBOL)
+    return float(t["price"])
+
+def get_free_asset(client, asset):
+    b = client.get_asset_balance(asset=asset)
+    return float(b["free"]) if b else 0.0
+
+def market_buy(client, usdc_amount, sym_info):
+    price = get_last_price(client)
+    qty = usdc_amount / price
+    qty = max(round_step(qty, sym_info["step"]), sym_info["min_qty"])
+    if qty * price < 5:  # mini notionnel de Binance
+        return None, None
+
+    try:
+        order = client.order_market_buy(symbol=SYMBOL, quantity=qty)
+        fills = order.get("fills", [])
+        fill_price = price
+        if fills:
+            total_q = sum(float(f["qty"]) for f in fills)
+            total_paid = sum(float(f["price"]) * float(f["qty"]) for f in fills)
+            fill_price = total_paid / total_q if total_q > 0 else price
+        log(f"ACHAT {SYMBOL} qty={qty} ~price={fill_price} | {'DIRECT' if LIVE else 'TEST'}")
+        return qty, fill_price
+    except BinanceAPIException as e:
+        log("ERREUR BUY:", e)
+        return None, None
+
+def market_sell(client, qty):
+    try:
+        order = client.order_market_sell(symbol=SYMBOL, quantity=qty)
+        fills = order.get("fills", [])
+        price = get_last_price(client)
+        if fills:
+            total_q = sum(float(f["qty"]) for f in fills)
+            total_got = sum(float(f["price"]) * float(f["qty"]) for f in fills)
+            price = total_got / total_q if total_q > 0 else price
+        log(f"VENTE {SYMBOL} qty={qty} ~price={price} | {'DIRECT' if LIVE else 'TEST'}")
+        return price
+    except BinanceAPIException as e:
+        log("ERREUR SELL:", e)
+        return None
+
+# ==========
+#   BOT
+# ==========
+def try_trade_once(client, sym_info):
+    """Stratégie super simple : si aucune position, acheter un petit pourcentage;
+       si en position, sortir TP/SL."""
+    global position, daily_pnl_usdc
+
+    last = get_last_price(client)
+
+    # Pas de position : on achète un petit montant
+    if position is None:
+        free_usdc = get_free_asset(client, "USDC")
+        budget = min(MAX_USDC, free_usdc)
+        if budget < 10:
+            log("USDC insuffisant pour un trade.")
+            return
+
+        usdc_to_use = max(10, budget * TRADE_FRACTION)  # mini 10 USDC
+        qty, entry = market_buy(client, usdc_to_use, sym_info)
+        if qty and entry:
+            tp = round_tick(entry * (1 + TP_PCT), sym_info["tick"])
+            sl = round_tick(entry * (1 - SL_PCT), sym_info["tick"])
+            position = {"qty": qty, "cost": entry, "tp": tp, "sl": sl}
+            log(f"Position ouverte: qty={qty} cost={entry} tp={tp} sl={sl}")
         return
 
-    d["time"] = pd.to_datetime(d["time"])
-    d["date"] = d["time"].dt.date
-    d["week"] = d["time"].dt.to_period("W").astype(str)
-    d["month"] = d["time"].dt.to_period("M").astype(str)
+    # En position : vérifier TP/SL
+    if position:
+        qty = position["qty"]
+        cost = position["cost"]
+        tp = position["tp"]
+        sl = position["sl"]
 
-    by_day   = d.groupby("date")[["realized_pnl"]].sum().reset_index()
-    by_week  = d.groupby("week")[["realized_pnl"]].sum().reset_index()
-    by_month = d.groupby("month")[["realized_pnl"]].sum().reset_index()
+        if last >= tp:
+            # Take Profit
+            out = market_sell(client, qty)
+            if out:
+                pnl = (out - cost) * qty
+                daily_pnl_usdc += pnl
+                log(f"TP atteint. PNL réalisé: {pnl:.6f} USDC | Daily: {daily_pnl_usdc:.6f}")
+                position = None
+            return
 
-    summary = pd.DataFrame({
-        "metric": ["Total réalisé", "Jours avec trade", "PNL moyen/jour"],
-        "value": [
-            round(d["realized_pnl"].sum(), 2),
-            int(by_day.shape[0]),
-            round(d["realized_pnl"].sum() / max(1, by_day.shape[0]), 2)
-        ]
-    })
+        if last <= sl:
+            # Stop Loss
+            out = market_sell(client, qty)
+            if out:
+                pnl = (out - cost) * qty
+                daily_pnl_usdc += pnl
+                log(f"SL atteint. PNL réalisé: {pnl:.6f} USDC | Daily: {daily_pnl_usdc:.6f}")
+                position = None
+            return
 
-    with pd.ExcelWriter(REPORT_XLSX, engine="openpyxl") as xw:
-        d.to_excel(xw, sheet_name="TRADES", index=False)
-        by_day.to_excel(xw, sheet_name="JOURNALIER", index=False)
-        by_week.to_excel(xw, sheet_name="HEBDO", index=False)
-        by_month.to_excel(xw, sheet_name="MENSUEL", index=False)
-        summary.to_excel(xw, sheet_name="RESUME", index=False)
-from datetime import datetime
-from gdrive_uploader import upload_to_gdrive
+def handle_day_rollover():
+    """Si on passe à un nouveau jour (Europe/Paris), écrire le PnL jour et reset."""
+    global last_pnl_date
+    today = day_key(now_paris())
+    if last_pnl_date is None:
+        last_pnl_date = today
+        return
+    if today != last_pnl_date:
+        flush_daily_pnl()
+        log(f"--- Nouveau jour {today} ---")
+        last_pnl_date = today
 
-local_path = "/app/rapports/rapports.xlsx"  # même fichier tout le temps
-dest_name = "rapports.xlsx"
+def on_sigterm(signum, frame):
+    global running
+    log("SIGTERM reçu → arrêt propre.")
+    running = False
 
+def main():
+    global running
 
-file_id = upload_to_gdrive(local_path=local_path, dest_name=dest_name)
-print(f"[Drive] Rapport envoyé, file_id={file_id}")
+    # Sécurité Google Sheets
+    if not SPREADSHEET_ID:
+        log("⚠️  SPREADSHEET_ID manquant : le bot tournera sans écrire dans Google Sheets.")
+    else:
+        log("Google Sheets OK (SPREADSHEET_ID fourni).")
 
-# === TAILLE D’ORDRE ET GARDE-FOUS ============================================
-def allowed_notional_left():
-    """combien de capital il reste à utiliser sans dépasser MAX_CAP_USDC"""
-    used = float(state.get("used_cap", 0.0))
-    return max(0.0, MAX_CAP_USDC - used)
+    # Binance
+    client = binance_client()
+    sym_info = get_symbol_info(client, SYMBOL)
 
-def compute_order_qty(price):
-    """taille de l’ordre en BTC à partir de ORDER_NOTIONAL et du capital restant"""
-    notional = min(ORDER_NOTIONAL, allowed_notional_left())
-    if notional <= 0:
-        return 0.0
-    qty = notional / price
-    # arrondi sécurité (ex: 1e-6 BTC min)
-    return max(0.000001, round(qty, 6))
+    log(f"Démarrage bot | Symbol={SYMBOL} | LIVE={LIVE} | Budget max: {MAX_USDC} USDC")
+    signal.signal(signal.SIGTERM, on_sigterm)
 
-# === PLACEHOLDERS BINANCE =====================================================
-# Adapte ces deux fonctions à ta fonction actuelle d’envoi d’ordre.
-# Ici on les simule: retourne toujours status=TEST_OK et price passé en param.
-def place_buy(price, qty):
-    # --> ici mets ton appel client.order_market_buy(symbol=PAIR, quoteOrderQty=notional) ou équivalent
-    return {"status": "TEST_OK", "price": price, "executedQty": qty, "fee": 0.0}
+    while running:
+        try:
+            handle_day_rollover()
+            try_trade_once(client, sym_info)
+        except Exception as e:
+            log("Loop error:", e)
+        time.sleep(SLEEP_SEC)
 
-def place_sell(price, qty):
-    # --> ici mets ton appel client.order_market_sell(symbol=PAIR, quantity=qty)
-    return {"status": "TEST_OK", "price": price, "executedQty": qty, "fee": 0.0}
+    # À l’arrêt, on écrit le PnL restant du jour
+    flush_daily_pnl()
+    log("Arrêt terminé.")
 
-# === LOGIQUE EXEMPLE : micro-scalps ===========================================
-def trading_loop(get_price_func):
-    """
-    get_price_func() doit retourner le prix spot BTC/USDC (float).
-    Boucle: achète une petite taille puis revend avec TP/SL. Ajoute chaque trade au CSV
-    et régénère l’Excel à chaque cycle.
-    """
-    while True:
-        price = float(get_price_func())
-        qty   = compute_order_qty(price)
-        if qty > 0:
-            # BUY
-            r = place_buy(price, qty)
-            if r["status"] == "TEST_OK":
-                update_position_on_buy(price, qty)
-                append_trade("BUY", price, qty, note="scalp buy")
-                # Take Profit / Stop Loss
-                tp = price * (1 + TAKE_PROFIT_PCT)
-                sl = price * (1 - STOP_LOSS_PCT)
-                # boucle d'attente simple
-                while True:
-                    p = float(get_price_func())
-                    if p >= tp or p <= sl:
-                        r2 = place_sell(p, qty)
-                        if r2["status"] == "TEST_OK":
-                            realized = update_position_on_sell(p, qty)
-                            append_trade("SELL", p, qty, realized_pnl=realized,
-                                         note=("TP" if p>=tp else "SL"))
-                        break
-                    time.sleep(5)  # 5s entre checks
-
-                make_reports()
-
-        # régénère les rapports une fois par heure au cas où
-        if int(time.time()) % 3600 < 5:
-            make_reports()
-
-        time.sleep(10)  # souffle entre cycles
+if __name__ == "__main__":
+    main()
